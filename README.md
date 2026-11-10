@@ -1,73 +1,132 @@
-# NexusLake: An End-to-End Medallion Architecture Data Lake with Kafka, Databricks, and Athena
+# NexusLake: Medallion Data Lake with Kafka, Airflow, Databricks and Athena
 
-[![Architecture Diagram](architecture_diagram.png)](architecture_diagram.png)
+![Architecture](architecture_diagram.jpg)
 
 ## Overview
 
-This project implements a comprehensive, robust, and scalable Data Lake architecture on AWS, following the Medallion (Bronze, Silver, Gold) design pattern. It integrates a real-time ingestion pipeline with scheduled, complex transformations, leveraging the power of Databricks-managed Spark in the cloud while maintaining data locality for core components. The solution is fully orchestrated using Apache Airflow.
+NexusLake is an end-to-end data pipeline that follows the Medallion (Bronze / Silver / Gold) pattern.
+Mock transactions are produced to Kafka (Avro + Schema Registry) by an Airflow DAG, transformed by
+PySpark jobs running on **Databricks serverless compute**, stored as **Delta tables on AWS S3**, and
+queried with **AWS Athena** through the Glue Data Catalog.
 
-A key highlight is the hybrid architecture, which securely bridges a local Docker-based Kafka cluster to a cloud-native Databricks environment using an Ngrok tunnel, enabling high-performance Spark Structured Streaming jobs without complex VPN setups.
+The setup is hybrid: Kafka, Redis, Postgres and Airflow run locally in Docker, while Spark runs in the cloud.
+An **ngrok TCP tunnel** exposes the local Kafka broker to Databricks.
 
-## Core Features
+## How it works
 
-* **Event-Driven Ingestion:** Apache Kafka handles real-time data input, orchestrated by Apache Airflow.
-* **Schema Registry:** Confluent Schema Registry manages Avro schemas for structured and reliable data evolution.
-* **Idempotency (Dual-Layer):**
-    * *Kafka:* Enables message idempotence to ensure once-only delivery.
-    * *Application:* Uses Redis to cache transaction IDs, preventing duplication at the producer level.
-* **Medallion Architecture (Bronze, Silver, Gold):** Verifiably structured data storage in AWS S3, enabling phased data refinement.
-* **Cloud-Native Spark:** Databricks-managed Spark clusters perform all transformation logic, ensuring elastic scaling and high performance.
-* **Ngrok Bridge:** Securely exposes local Kafka to the cloud, enabling frictionless hybrid cloud setups.
-* **Serverless BI (Athena):** AWS Glue Crawlers populate a Data Catalog, allowing immediate serverless SQL querying via AWS Athena on Gold refined data.
-* **Full Orchestration:** Multiple Airflow DAGs manage the scheduling, dependencies, and execution flow of ingestion and transformations.
+1. **Ingestion (Airflow DAG `nexuslake_ingestion_v1`, every 5 minutes):** a Python producer generates 10 mock
+   transactions, checks each `transaction_id` in Redis, serializes the message with the Avro schema
+   (`src/schemas/transaction_schema.avsc`, registered in Schema Registry) and writes it to the Kafka topic `nexus_transactions`.
+2. **Transformation (Airflow DAG `nexuslake_transformation_v1`, daily at 17:00):** three tasks run in order.
+   Airflow submits each one to Databricks with the Jobs API (`DatabricksSubmitRunOperator`).
+   * **Bronze:** reads new messages from Kafka (through ngrok) and appends the raw records to a Delta table (`availableNow` trigger).
+   * **Silver:** reads Bronze, parses the Avro payload and casts types, writes a Delta table.
+   * **Gold:** aggregates Silver into `customer_spending_summary` and `currency_stats` (overwrite, Athena-compatible Delta settings).
+3. **BI:** a Glue Crawler (Delta Lake data source, native tables) registers the Gold tables in the Glue Data Catalog and Athena queries them with SQL.
 
-## Architecture Flow
+### Reliability notes
+* Kafka producer runs with `enable.idempotence=true` and `acks=all`.
+* Redis keeps an atomic reservation (`SET NX`) per `transaction_id`: confirmed after Kafka acknowledges delivery,
+  released on failure so the record can be retried. Reservations expire after 1 hour.
+* Spark uses checkpoints in S3. Kafka data is kept in Docker volumes, so topic offsets stay consistent with the checkpoints.
+  If you ever delete the Kafka volume, also clear the `checkpoints/` folder on S3, otherwise Bronze fails with
+  "offset was changed".
 
-1.  **Ingestion (DAG every 5 mins):** Airflow triggers a Python Producer.
-2.  **Schema Check & Idempotency:** The producer validates schemas against Schema Registry and checks transaction IDs against Redis.
-3.  **Data Write:** Verified, unique data is written to Kafka in Avro format.
-4.  **Transformation (DAG Daily):** A transformation DAG with sequential tasks is triggered daily in Databricks.
-    * **Bronze:** Reads incremental data from Kafka and writes raw Parquet files to S3a (Bronze location).
-    * **Silver:** Reads raw Parquet, parses Avro, applies casting, and writes refined Delta tables to S3a (Silver location).
-    * **Gold:** Reads refined Delta, applies business logic, performs aggregations, and overwrites Athena-compatible Delta tables to S3a (Gold location).
-5.  **BI Readiness:** Gold data is crawled by AWS Glue, creating a metastore used by AWS Athena for SQL queries.
+## Project structure
 
-## Technologies Used
+```
+dags/                    Airflow DAGs (ingestion, transformation)
+src/ingestion/           Mock data generator and Kafka producer
+src/processing/          Bronze, Silver, Gold PySpark jobs (run on Databricks)
+src/schemas/             Avro schema
+src/utils/helpers.py     Paths and secrets (Databricks secrets or environment variables)
+infrastructure/          Dockerfile, docker-compose.yml, .env.example
+```
 
-* **Infrastructure:** AWS S3 (Bucket), Docker Compose, Ngrok.
-* **Streaming:** Apache Kafka, Confluent Schema Registry (Avro).
-* **Caching:** Redis.
-* **Computing:** Databricks Spark (Cloud-Managed), Pyspark (Python).
-* **Orchestration:** Apache Airflow.
-* **Catalog & Query:** AWS Glue Crawler, AWS Glue Data Catalog, AWS Athena.
+## Technologies
 
-## Getting Started
+Apache Kafka, Confluent Schema Registry (Avro), Redis, Apache Airflow 2.10, PostgreSQL, Docker Compose,
+Databricks (serverless), PySpark, Delta Lake, AWS S3, AWS Glue (Crawler, Data Catalog), AWS Athena, ngrok.
+
+## Getting started
 
 ### Prerequisites
+* Docker and Docker Compose
+* AWS account (S3 bucket, Glue, Athena) and an IAM access key
+* Databricks workspace (the Free Edition works) and a personal access token
+* ngrok account and auth token
 
-* Docker and Docker Compose.
-* An AWS Account with S3 permissions (Access Key and Secret Key).
-* A Databricks workspace.
-* An Ngrok Account and AuthToken.
+### 1. Configure secrets (never commit them)
+Create a Databricks secret scope and store the credentials there. The jobs read them at runtime.
 
-### Steps to Run
+```bash
+export DBX_HOST=<your-workspace-host>          # e.g. dbc-xxxx.cloud.databricks.com
+printf "Databricks token: "; read -s DBX_TOKEN; echo; export DBX_TOKEN
 
-1.  **Configure AWS Credentials:** Please update `src > utils > helpers.py` file for your AWS Access Key, Secret Key, and Bucket name.
-2.  **Start Local Infrastructure:**
-    ```bash
-    docker compose up -d --build
-    ```
-    This command starts Kafka, Schema Registry, Redis, PostgreSQL, and Airflow.
-3.  **Setup Ngrok Tunnel:** In a separate terminal or within Docker, expose your local Kafka listener (e.g., port 9094) publicly.
-    ```bash
-    ngrok tcp 9094
-    ```
-    *Update your Databricks scripts and Airflow configuration with the public TCP address provided by Ngrok.*
-4.  **Access Airflow UI:** Open `http://localhost:8080`. Activate the DAGs:
-    * `nexuslake_ingestion_v1`: For 5-minute ingestion.
-    * `nexuslake_transformation_v1`: For daily transformations on Databricks.
-5.  **Verify BI Path (AWS Console):** Run the Glue Crawler to generate the schema from your Gold data in S3. Use Athena to query the results.
+curl -s -X POST "https://$DBX_HOST/api/2.0/secrets/scopes/create" \
+  -H "Authorization: Bearer $DBX_TOKEN" \
+  -d '{"scope":"nexuslake","initial_manage_principal":"users"}'
 
-## Contributing
+put() { printf "$1: "; read -s v; echo; curl -s -X POST "https://$DBX_HOST/api/2.0/secrets/put" \
+  -H "Authorization: Bearer $DBX_TOKEN" \
+  -d "{\"scope\":\"nexuslake\",\"key\":\"$1\",\"string_value\":\"$v\"}"; }
 
-Contributions are welcome. Please submit a Pull Request.
+put aws_access_key
+put aws_secret_key
+put kafka_bootstrap_servers      # ngrok address, e.g. 0.tcp.eu.ngrok.io:12345
+```
+
+### 2. Upload the project to Databricks
+Put the `src/` folder in your workspace (a Git folder or `/Workspace/Users/<you>/NexusLake`).
+The jobs expect `src/processing`, `src/utils` and `src/schemas` next to each other.
+
+### 3. Start the local stack
+```bash
+cd infrastructure
+cp .env.example .env        # fill in the values
+ngrok tcp 9094              # copy the address into NGROK_KAFKA_ADDRESS and into the Databricks secret
+docker compose up -d --build
+```
+`.env` values: `AIRFLOW_CONN_DATABRICKS_DEFAULT`, `NEXUS_DATABRICKS_REPO_PATH`, `NGROK_KAFKA_ADDRESS`.
+When ngrok gives you a new address, update `.env`, run `docker compose up -d broker`, and update the
+`kafka_bootstrap_servers` secret.
+
+### 4. Run the pipeline
+Open Airflow at http://localhost:8080 (default login `admin` / `pass`, change it through `AIRFLOW_ADMIN_PASSWORD`).
+Enable and trigger `nexuslake_ingestion_v1`, then `nexuslake_transformation_v1`.
+Spark logs for each step are visible on the Databricks run page.
+
+### 5. Query with Athena
+Create a Glue database, then a Glue Crawler with two **Delta Lake** data sources
+(`s3://<bucket>/gold/customer_spending_summary/` and `s3://<bucket>/gold/currency_stats/`) and
+**Create native tables** enabled. The crawler role needs read access to the bucket. Then in Athena:
+
+```sql
+SELECT * FROM nexuslake.customer_spending_summary LIMIT 10;
+SELECT * FROM nexuslake.currency_stats;
+```
+
+## Data quality and tests
+
+Quality rules live in `src/quality/rules.py` (pure Python) and are enforced at three points:
+
+| Where | Check | On failure |
+|-------|-------|------------|
+| Producer | `validate_record`: non-empty id, positive customer id, amount range, supported currency, sane timestamp | record is skipped and logged |
+| Silver | same rules as a Spark condition (`src/quality/spark_checks.py`) | row goes to `quarantine/transactions` on S3 instead of Silver |
+| Gold | reconciliation: row counts and total amounts of both Gold tables must equal Silver | job fails **before** writing, Athena never sees bad data |
+
+Run the unit tests locally:
+
+```bash
+pip3 install -r requirements-dev.txt
+pytest
+```
+
+Tests for the Spark condition and the DAG structure run automatically when `pyspark` (and Java) or
+`apache-airflow` are installed, otherwise they are skipped.
+
+## Known limitations / roadmap
+* Single Kafka broker, no authentication; ngrok address changes on every restart.
+* Deduplication happens at the producer and only within the Redis TTL window. Silver does not deduplicate yet, so end-to-end    delivery is at-least-once, not exactly-once.
+* Infrastructure is created by hand (no Terraform), no CI.

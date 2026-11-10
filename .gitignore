@@ -1,7 +1,22 @@
 
-.databricks
-.venv
 .vscode
-.DS_Store
 .AppleDouble
 .LSOverride
+
+.env
+infrastructure/.env
+*.pem
+*.key
+ 
+__pycache__/
+.pytest_cache
+*.pyc
+.venv/
+venv/
+
+.DS_Store
+__MACOSX/
+.idea/
+
+.databricks/
+.bundle/

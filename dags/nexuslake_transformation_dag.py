@@ -1,10 +1,13 @@
-import sys
 import os
-from airflow import DAG
-from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from datetime import datetime, timedelta
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from airflow import DAG
+from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
+
+
+DATABRICKS_REPO_PATH = os.getenv("NEXUS_DATABRICKS_REPO_PATH", "/Workspace/Repos/CHANGE_ME/NexusLake")
+DATABRICKS_CLUSTER_ID = os.getenv("NEXUS_DATABRICKS_CLUSTER_ID", "CHANGE_ME")
+DATABRICKS_CONN_ID = "databricks_default"
 
 default_args = {
     'owner': 'ugurcankok',
@@ -12,42 +15,48 @@ default_args = {
     'start_date': datetime(2026, 3, 1),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
+    'databricks_conn_id': DATABRICKS_CONN_ID,
 }
+
+
+def databricks_task(task_id: str, script: str) -> DatabricksSubmitRunOperator:
+    """Runs a PySpark script within a repository on Databricks Serverless compute."""
+    return DatabricksSubmitRunOperator(
+        task_id=task_id,
+        json={
+            "run_name": f"nexuslake_{task_id}",
+            "tasks": [
+                {
+                    "task_key": task_id,
+                    "spark_python_task": {
+                        "python_file": f"{DATABRICKS_REPO_PATH}/src/processing/{script}",
+                        "parameters": [f"{DATABRICKS_REPO_PATH}/src"],
+                    },
+                    "environment_key": "default",
+                }
+            ],
+            "environments": [
+                {"environment_key": "default", "spec": {"environment_version": "2"}}
+            ],
+        },
+    )
 
 with DAG(
     'nexuslake_transformation_v1',
     default_args=default_args,
-    description='Daily Bronze to Gold Spark Pipeline',
-    schedule_interval='0 17 * * *', # Triggers every day at 5:00 PM
+    description='Daily Bronze to Gold Spark Pipeline (Databricks)',
+    schedule_interval='0 17 * * *',  # Every day 17:00
     catchup=False,
-    tags=['nexuslake', 'spark', 'gold', 'silver']
+    tags=['nexuslake', 'databricks', 'gold', 'silver']
 ) as dag:
 
-    # 1. Task: Kafka -> Bronze (Incremental Ingest)
-    bronze_task = SparkSubmitOperator(
-        task_id='run_bronze_ingest',
-        application='/opt/airflow/dags/src/processing/bronze_transform.py',
-        conn_id='spark_default',
-        packages='org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4',
-        verbose=True
-    )
+    # 1. Kafka -> Bronze
+    bronze_task = databricks_task('run_bronze_ingest', 'bronze_transform.py')
 
-    # 2. Task: Bronze -> Silver (Avro Parse & Cast)
-    silver_task = SparkSubmitOperator(
-        task_id='run_silver_transform',
-        application='/opt/airflow/dags/src/processing/silver_transform.py',
-        conn_id='spark_default',
-        packages='org.apache.spark:spark-avro_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4',
-        verbose=True
-    )
+    # 2. Bronze -> Silver (Avro parse & cast)
+    silver_task = databricks_task('run_silver_transform', 'silver_transform.py')
 
-    # 3. Task: Silver -> Gold (Analytics & Athena Compliance)
-    gold_task = SparkSubmitOperator(
-        task_id='run_gold_transform',
-        application='/opt/airflow/dags/src/processing/gold_transform.py',
-        conn_id='spark_default',
-        packages='io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4',
-        verbose=True
-    )
+    # 3. Silver -> Gold (Analytics)
+    gold_task = databricks_task('run_gold_transform', 'gold_transform.py')
 
     bronze_task >> silver_task >> gold_task

@@ -12,13 +12,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("GoldTransform")
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+except NameError: 
+    SRC_DIR = sys.argv[1]
+sys.path.append(SRC_DIR)
 try:
     from utils.helpers import (
+        safe,
         SILVER_PATH, 
         GOLD_CUSTOMER_PATH, 
         GOLD_CURRENCY_PATH
     )
+    from quality.rules import reconcile, DataQualityError
 except ImportError as e:
     logger.error(f"Helpers import error: {e}")
     raise
@@ -28,23 +34,28 @@ def run_gold_transformation():
 
     spark = SparkSession.builder \
         .appName("NexusLake-Gold-Transformation") \
-        .config("spark.jars.packages", "org.apache.spark:spark-avro_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .config("spark.databricks.delta.properties.defaults.minReaderVersion", "1") \
-        .config("spark.databricks.delta.properties.defaults.minWriterVersion", "2") \
-        .config("spark.databricks.delta.properties.defaults.columnMapping.mode", "none") \
-        .config("spark.databricks.delta.properties.defaults.enableDeletionVectors", "false") \
         .getOrCreate()
+
+    athena_confs = {
+        "spark.databricks.delta.properties.defaults.minReaderVersion": "1",
+        "spark.databricks.delta.properties.defaults.minWriterVersion": "2",
+        "spark.databricks.delta.properties.defaults.columnMapping.mode": "none",
+        "spark.databricks.delta.properties.defaults.enableDeletionVectors": "false",
+    }
+    for key, value in athena_confs.items():
+        try:
+            spark.conf.set(key, value)
+        except Exception as e:
+            logger.warning(f"Config could not be set on this compute ({key}): {e}")
 
     logger.info("The Gold Transformation Process Has Begun")
 
     try:
-        logger.info(f"Reading the Silver data from the source:: {SILVER_PATH}")
+        logger.info(f"Reading the Silver data from the source:: {safe(SILVER_PATH)}")
         silver_df = spark.read.format("delta").load(SILVER_PATH)
 
         #  Analysis 1: Total Spending by Customer
-        logger.info("Müşteri harcama özeti hesaplanıyor...")
+        logger.info("Customer spending summary is being calculated...")
         customer_summary = silver_df.groupBy("customer_id") \
             .agg(
                 sum("amount").alias("total_spent"),
@@ -60,14 +71,27 @@ def run_gold_transformation():
                 count("transaction_id").alias("total_count")
             )
 
+        # Data quality: If the summaries do not match the Silver layer, do NOT write to the Gold layer (to prevent corrupt data from reaching Athena).
+        silver_stats = silver_df.agg(count("*").alias("n"), sum("amount").alias("total")).collect()[0]
+        customer_stats = customer_summary.agg(sum("transaction_count").alias("n"), sum("total_spent").alias("total")).collect()[0]
+        currency_stats = currency_summary.agg(sum("total_count").alias("n"), sum("total_volume").alias("total")).collect()[0]
+        problems = reconcile(
+            silver_stats["n"], silver_stats["total"],
+            customer_stats["n"], customer_stats["total"],
+            currency_stats["n"], currency_stats["total"],
+        )
+        if problems:
+            raise DataQualityError("Gold quality check failed: " + "; ".join(problems))
+        logger.info(f"Gold quality check passed ({silver_stats['n']} silver rows reconciled).")
+
         # Overwrite the Gold Layer
-        logger.info(f"Customer summary is being generated: {GOLD_CUSTOMER_PATH}")
+        logger.info(f"Customer summary is being generated: {safe(GOLD_CUSTOMER_PATH)}")
         customer_summary.write.format("delta") \
             .mode("overwrite") \
             .option("overwriteSchema", "true") \
             .save(GOLD_CUSTOMER_PATH)
         
-        logger.info(f"Foreign exchange statistics are being compiled: {GOLD_CURRENCY_PATH}")
+        logger.info(f"Foreign exchange statistics are being compiled: {safe(GOLD_CURRENCY_PATH)}")
         currency_summary.write.format("delta") \
             .mode("overwrite") \
             .option("overwriteSchema", "true") \

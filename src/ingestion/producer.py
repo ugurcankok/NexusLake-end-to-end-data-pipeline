@@ -1,11 +1,11 @@
-import json
-import time
 import os
 import sys
 import logging
 import redis
 from pathlib import Path
-from src.ingestion.generator import generate_mock_transaction
+from src.ingestion.generator import generate_batch
+from src.ingestion.dedup import Deduplicator
+from src.ingestion.sender import send_batch
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
@@ -17,6 +17,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("NexusProducer")
+
+TOPIC = 'nexus_transactions'
+BATCH_SIZE = int(os.getenv("NEXUS_BATCH_SIZE", "10"))
+DUPLICATE_RATE = float(os.getenv("NEXUS_DUPLICATE_RATE", "0.2"))
 
 # Kafka Configuration
 KAFKA_CONF = {
@@ -34,53 +38,34 @@ def get_redis_client():
         logger.error(f"Redis connection error: {e}")
         raise
 
-def delivery_report(err, msg):
-    if err is not None:
-        logger.error(f"The message could not be sent: {err}")
-    else:
-        logger.info(f"The message was sent successfully: Topic: {msg.topic()}, Partition: {msg.partition()}")
-
 def run_producer():
     logger.info("Producer is starting...")
-    r = get_redis_client()
-    
+    dedup = Deduplicator(get_redis_client())
+
     try:
         schema_registry_client = SchemaRegistryClient({'url': 'http://schema-registry:8081'})
 
-        # Set the schema path to dynamic or static
         current_script_path = Path(__file__).resolve()
-        project_root = current_script_path.parent.parent.parent
-        schema_path = project_root / "config" / "schemas" / "transaction.avsc"
-        
+        src_root = current_script_path.parent.parent  # .../src
+        schema_path = src_root / "schemas" / "transaction_schema.avsc"
+
         if not os.path.exists(schema_path):
             logger.error(f"Schema file not found: {schema_path}")
             return
 
         with open(schema_path, "r") as f:
             schema_str = f.read()
-        
+
         avro_serializer = AvroSerializer(schema_registry_client, schema_str)
         producer = SerializingProducer({**KAFKA_CONF, 'value.serializer': avro_serializer})
 
-        sent_count = 0
-        for _ in range(10):
-            tx_data = generate_mock_transaction()
-            tx_id = tx_data['transaction_id']
-            
-            # Application-level Idempotency (Redis)
-            if not r.exists(tx_id):
-                producer.produce(
-                    topic='nexus_transactions',
-                    value=tx_data,
-                    on_delivery=delivery_report
-                )
-                r.setex(tx_id, 3600, "processed")
-                sent_count += 1
-            else:
-                logger.warning(f"Duplicate data has been blocked: {tx_id}")
+        records = generate_batch(BATCH_SIZE, DUPLICATE_RATE)
+        stats = send_batch(producer, dedup, records, TOPIC)
 
-        producer.flush()
-        logger.info(f"The operation is complete. A total of {sent_count} new messages were sent.")
+        logger.info(
+            f"The operation is complete. Generated {len(records)}: "
+            f"{stats['sent']} sent, {stats['duplicate']} duplicate(s) blocked, {stats['invalid']} invalid skipped."
+        )
 
     except Exception as e:
         logger.error(f"A critical error occurred while Producer was running: {str(e)}")

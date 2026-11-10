@@ -1,12 +1,33 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: nexuslake-airflow:latest
+  environment: &airflow-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://nexus_user:nexus_password@postgres/nexus_gold
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-nexuslake-dev-secret-key}
+    PYTHONPATH: /opt/airflow/dags
+    AIRFLOW_CONN_DATABRICKS_DEFAULT: ${AIRFLOW_CONN_DATABRICKS_DEFAULT:-}
+    NEXUS_DATABRICKS_REPO_PATH: ${NEXUS_DATABRICKS_REPO_PATH:-}
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - ../src:/opt/airflow/dags/src
+    - airflow-logs:/opt/airflow/logs
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
 
   broker:
-    image: confluentinc/cp-server:7.4.0
+    image: confluentinc/cp-kafka:7.4.0
     depends_on:
       - zookeeper
     ports:
@@ -16,18 +37,20 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,NGROK://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092,NGROK://${NGROK_KAFKA_URL}
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092,NGROK://${NGROK_KAFKA_ADDRESS:-localhost:9094}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,NGROK:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 15s
+      timeout: 30s
+      retries: 10
+      start_period: 40s
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.4.0
@@ -40,12 +63,14 @@ services:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'PLAINTEXT://broker:29092'
 
-  redis: 
+  redis:
     image: redis:7.0-alpine
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
 
-  postgres: 
+  postgres:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: nexus_user
@@ -53,6 +78,8 @@ services:
       POSTGRES_DB: nexus_gold
     ports:
       - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nexus_user -d nexus_gold"]
       interval: 5s
@@ -60,46 +87,35 @@ services:
       retries: 5
 
   airflow-init:
-    build: .
+    <<: *airflow-common
     depends_on:
-      - postgres
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://nexus_user:nexus_password@postgres/nexus_gold
-    user: "0:0" 
+      postgres:
+        condition: service_healthy
     command: >
-      bash -c "airflow db init &&
-      airflow users create --username admin --firstname name --lastname lname --role Admin --email email0@gmail.com --password pass"
+      bash -c "airflow db migrate &&
+      (airflow users create --username admin --firstname name --lastname lname
+      --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-pass} || true)"
 
   airflow-webserver:
-    build: .
+    <<: *airflow-common
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://nexus_user:nexus_password@postgres/nexus_gold
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - PYTHONPATH=/opt/airflow/dags
-      - _PIP_ADDITIONAL_DEPENDENCIES=confluent-kafka[avro] redis fastavro
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../src:/opt/airflow/dags/src
-      - ../config:/opt/airflow/config
     ports:
       - "8080:8080"
     command: webserver
 
   airflow-scheduler:
-    build: .
+    <<: *airflow-common
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://nexus_user:nexus_password@postgres/nexus_gold
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - _PIP_ADDITIONAL_DEPENDENCIES=confluent-kafka[avro] redis fastavro
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../src:/opt/airflow/dags/src
-      - ../config:/opt/airflow/config
     command: scheduler
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  redis-data:
+  postgres-data:
+  airflow-logs:

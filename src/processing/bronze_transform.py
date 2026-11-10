@@ -11,9 +11,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BronzeIngest")
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+except NameError:  
+    SRC_DIR = sys.argv[1]
+sys.path.append(SRC_DIR)
 try:
     from utils.helpers import (
+        safe,
         KAFKA_BOOTSTRAP_SERVERS, 
         KAFKA_TOPIC, 
         BRONZE_PATH, 
@@ -46,7 +51,7 @@ def run_bronze_streaming():
             .options(**kafka_options) \
             .load()
 
-        logger.info(f"The write operation is starting (Delta Format). Target: {BRONZE_PATH}")
+        logger.info(f"The write operation is starting (Delta Format). Target: {safe(BRONZE_PATH)}")
 
         query = raw_df.writeStream \
             .format("delta") \
